@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.9;
 
-import "hardhat/console.sol";
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "prb-math/contracts/PRBMathSD59x18.sol";
 import "./OrderPool.sol";
 
@@ -10,6 +10,10 @@ import "./OrderPool.sol";
 library LongTermOrdersLib {
     using PRBMathSD59x18 for int256;
     using OrderPoolLib for OrderPoolLib.OrderPool;
+    using SafeERC20 for IERC20;
+
+    ///@notice fee for LP providers, 4 decimal places, i.e. 30 = 0.3%
+    uint256 public constant LP_FEE = 30;
 
     ///@notice information associated with a long term order
     struct Order {
@@ -30,6 +34,9 @@ library LongTermOrdersLib {
         ///@notice token pair being traded in embedded amm
         address tokenA;
         address tokenB;
+        ///@notice useful addresses for WETH transactions
+        address refTWAMM;
+        address refWETH;
         ///@notice mapping from token address to pool that is selling that token
         ///we maintain two order pools, one for each token that is tradable in the AMM
         mapping(address => OrderPoolLib.OrderPool) OrderPoolMap;
@@ -37,13 +44,10 @@ library LongTermOrdersLib {
         uint256 orderId;
         ///@notice mapping from order ids to Orders
         mapping(uint256 => Order) orderMap;
-
         ///@notice mapping from account address to its corresponding list of order ids
         mapping(address => uint256[]) orderIdMap;
-
         ///@notice mapping from order id to its status (false for nonactive true for active)
         mapping(uint256 => bool) orderIdStatusMap;
-
     }
 
     ///@notice initialize state
@@ -51,18 +55,23 @@ library LongTermOrdersLib {
         LongTermOrders storage self,
         address tokenA,
         address tokenB,
+        address refTWAMM,
+        address refWETH,
         uint256 lastVirtualOrderBlock,
         uint256 orderBlockInterval
     ) internal {
         self.tokenA = tokenA;
         self.tokenB = tokenB;
+        self.refTWAMM = refTWAMM;
+        self.refWETH = refWETH;
         self.lastVirtualOrderBlock = lastVirtualOrderBlock;
         self.orderBlockInterval = orderBlockInterval;
     }
 
-    ///@notice swap token A for token B. Amount represents total amount being sold, numberOfBlockIntervals determines when order expires
+    ///@notice long term swap token A for token B. Amount represents total amount being sold, numberOfBlockIntervals determines when order expires
     function longTermSwapFromAToB(
         LongTermOrders storage self,
+        address sender,
         uint256 amountA,
         uint256 numberOfBlockIntervals,
         mapping(address => uint256) storage reserveMap
@@ -72,15 +81,17 @@ library LongTermOrdersLib {
                 self,
                 self.tokenA,
                 self.tokenB,
+                sender,
                 amountA,
                 numberOfBlockIntervals,
                 reserveMap
             );
     }
 
-    ///@notice swap token B for token A. Amount represents total amount being sold, numberOfBlockIntervals determines when order expires
+    ///@notice long term swap token B for token A. Amount represents total amount being sold, numberOfBlockIntervals determines when order expires
     function longTermSwapFromBToA(
         LongTermOrders storage self,
+        address sender,
         uint256 amountB,
         uint256 numberOfBlockIntervals,
         mapping(address => uint256) storage reserveMap
@@ -90,6 +101,7 @@ library LongTermOrdersLib {
                 self,
                 self.tokenB,
                 self.tokenA,
+                sender,
                 amountB,
                 numberOfBlockIntervals,
                 reserveMap
@@ -101,15 +113,16 @@ library LongTermOrdersLib {
         LongTermOrders storage self,
         address from,
         address to,
+        address sender,
         uint256 amount,
         uint256 numberOfBlockIntervals,
         mapping(address => uint256) storage reserveMap
     ) private returns (uint256) {
         //update virtual order state
-        executeVirtualOrdersUntilCurrentBlock(self, reserveMap);
+        executeVirtualOrdersUntilSpecifiedBlock(self, reserveMap, block.number);
 
         // transfer sale amount to contract
-        ERC20(from).transferFrom(msg.sender, address(this), amount);
+        IERC20(from).safeTransferFrom(sender, address(this), amount);
 
         //determine the selling rate based on number of blocks to expiry and total amount
         uint256 currentBlock = block.number;
@@ -123,64 +136,39 @@ library LongTermOrdersLib {
         //add order to correct pool
         OrderPoolLib.OrderPool storage OrderPool = self.OrderPoolMap[from];
         OrderPool.depositOrder(self.orderId, sellingRate, orderExpiry);
-        
+
         //add to order map
         self.orderMap[self.orderId] = Order(
             self.orderId,
             orderExpiry,
             sellingRate,
-            msg.sender,
+            sender,
             from,
             to
         );
 
-        // add user to orderId mapping list content 
-        self.orderIdMap[msg.sender].push(self.orderId);
+        // add user's corresponding orderId to orderId mapping list content
+        self.orderIdMap[sender].push(self.orderId);
 
         self.orderIdStatusMap[self.orderId] = true;
 
         return self.orderId++;
     }
-    
-    // ///@notice remove orderId from user orderIdMap after the order is physically cancelled
-    // function removeOrderId(
-    //     LongTermOrders storage self,
-    //     uint256 orderId,
-    //     address account
-    // ) internal view {
-    //     uint256[] memory orderIdList = self.orderIdMap[account];
-    //     require(orderIdList.length > 0, "this sender doesn't have long term swap orders");
-        // if (orderIdList.length == 1) {
-        //     delete orderIdList[0];
-        // }
-        // uint l = 0;
-        // uint r = orderIdList.length - 1;
-        // uint m ;
-        // while (l < r) {
-        //    m = uint(l + r / 2);
-        //    if ( orderIdList[m] < orderId) {
-        //         l = m + 1;
-        //    } else if ( orderIdList[m] > orderId) {
-        //        r = m - 1;
-        //    } else {
-        //        delete orderIdList[m];
-        //    }
-        // }
-
-
-    // }
 
     ///@notice cancel long term swap, pay out unsold tokens and well as purchased tokens
     function cancelLongTermSwap(
         LongTermOrders storage self,
+        address sender,
         uint256 orderId,
+        bool proceedETH,
         mapping(address => uint256) storage reserveMap
-    ) internal {
+    ) internal returns (uint256) {
         //update virtual order state
-        executeVirtualOrdersUntilCurrentBlock(self, reserveMap);
+        executeVirtualOrdersUntilSpecifiedBlock(self, reserveMap, block.number);
 
         Order storage order = self.orderMap[orderId];
-        require(order.owner == msg.sender, "sender must be order owner");
+
+        require(order.owner == sender, "Sender Must Be Order Owner");
 
         OrderPoolLib.OrderPool storage OrderPool = self.OrderPoolMap[
             order.sellTokenId
@@ -189,44 +177,88 @@ library LongTermOrdersLib {
             orderId
         );
 
-        require(
-            unsoldAmount > 0 || purchasedAmount > 0,
-            "no proceeds to withdraw"
-        );
-        //transfer to owner
-        ERC20(order.buyTokenId).transfer(msg.sender, purchasedAmount);
-        ERC20(order.sellTokenId).transfer(msg.sender, unsoldAmount);
+        //charge LP fee
+        uint256 purchasedAmountMinusFee = (purchasedAmount * (10000 - LP_FEE)) /
+            10000;
 
+        require(
+            unsoldAmount > 0 || purchasedAmountMinusFee > 0,
+            "No Proceeds To Withdraw"
+        );
 
         // delete orderId from account list
-        // removeOrderId(self, orderId, msg.sender);
         self.orderIdStatusMap[orderId] = false;
+
+        //transfer to owner
+        if (proceedETH) {
+            if (order.buyTokenId == self.refWETH) {
+                IERC20(order.buyTokenId).safeTransfer(
+                    self.refTWAMM,
+                    purchasedAmountMinusFee
+                );
+                IERC20(order.sellTokenId).safeTransfer(sender, unsoldAmount);
+                return purchasedAmountMinusFee;
+            } else {
+                IERC20(order.sellTokenId).safeTransfer(
+                    self.refTWAMM,
+                    unsoldAmount
+                );
+                IERC20(order.buyTokenId).safeTransfer(
+                    sender,
+                    purchasedAmountMinusFee
+                );
+                return unsoldAmount;
+            }
+        } else {
+            IERC20(order.buyTokenId).safeTransfer(
+                sender,
+                purchasedAmountMinusFee
+            );
+            IERC20(order.sellTokenId).safeTransfer(sender, unsoldAmount);
+            return 0;
+        }
     }
 
     ///@notice withdraw proceeds from a long term swap (can be expired or ongoing)
     function withdrawProceedsFromLongTermSwap(
         LongTermOrders storage self,
+        address sender,
         uint256 orderId,
+        bool proceedETH,
         mapping(address => uint256) storage reserveMap
-    ) internal {
+    ) internal returns (uint256) {
         //update virtual order state
-        executeVirtualOrdersUntilCurrentBlock(self, reserveMap);
+        executeVirtualOrdersUntilSpecifiedBlock(self, reserveMap, block.number);
 
         Order storage order = self.orderMap[orderId];
-        require(order.owner == msg.sender, "sender must be order owner");
+        require(order.owner == sender, "Sender Must Be Order Owner");
 
         OrderPoolLib.OrderPool storage OrderPool = self.OrderPoolMap[
             order.sellTokenId
         ];
         uint256 proceeds = OrderPool.withdrawProceeds(orderId);
 
-        require(proceeds > 0, "no proceeds to withdraw");
-        //transfer to owner
-        ERC20(order.buyTokenId).transfer(msg.sender, proceeds);
+        //charge LP fee
+        uint256 proceedsMinusFee = (proceeds * (10000 - LP_FEE)) / 10000;
+
+        require(proceedsMinusFee > 0, "No Proceeds To Withdraw");
 
         // delete orderId from account list
-        // removeOrderId(self, orderId, msg.sender);
-        self.orderIdStatusMap[orderId] = false;
+        if (order.expirationBlock <= block.number) {
+            self.orderIdStatusMap[orderId] = false;
+        }
+
+        //transfer to owner
+        if (proceedETH && order.buyTokenId == self.refWETH) {
+            IERC20(order.buyTokenId).safeTransfer(
+                self.refTWAMM,
+                proceedsMinusFee
+            );
+            return proceedsMinusFee;
+        } else {
+            IERC20(order.buyTokenId).safeTransfer(sender, proceedsMinusFee);
+            return 0;
+        }
     }
 
     ///@notice executes all virtual orders between current lastVirtualOrderBlock and blockNumber
@@ -285,30 +317,45 @@ library LongTermOrdersLib {
         self.lastVirtualOrderBlock = blockNumber;
     }
 
-    ///@notice executes all virtual orders until current block is reached.
-    function executeVirtualOrdersUntilCurrentBlock(
+    ///@notice executes all virtual orders until specified block, includ current block.
+    function executeVirtualOrdersUntilSpecifiedBlock(
         LongTermOrders storage self,
-        mapping(address => uint256) storage reserveMap
+        mapping(address => uint256) storage reserveMap,
+        uint256 blockNumber
     ) internal {
+        require(
+            blockNumber <= block.number,
+            "Specified Block Number Cannot Be Greater Than The Current Block Number!"
+        );
         uint256 nextExpiryBlock = self.lastVirtualOrderBlock -
             (self.lastVirtualOrderBlock % self.orderBlockInterval) +
             self.orderBlockInterval;
+
+        OrderPoolLib.OrderPool storage OrderPoolA = self.OrderPoolMap[
+            self.tokenA
+        ];
+        OrderPoolLib.OrderPool storage OrderPoolB = self.OrderPoolMap[
+            self.tokenB
+        ];
+
         //iterate through blocks eligible for order expiries, moving state forward
-        while (nextExpiryBlock < block.number) {
-            executeVirtualTradesAndOrderExpiries(
-                self,
-                reserveMap,
-                nextExpiryBlock
-            );
+        while (nextExpiryBlock < blockNumber) {
+            // optimization for skipping blocks with no expiry
+            if (
+                OrderPoolA.salesRateEndingPerBlock[nextExpiryBlock] > 0 ||
+                OrderPoolB.salesRateEndingPerBlock[nextExpiryBlock] > 0
+            ) {
+                executeVirtualTradesAndOrderExpiries(
+                    self,
+                    reserveMap,
+                    nextExpiryBlock
+                );
+            }
             nextExpiryBlock += self.orderBlockInterval;
         }
         //finally, move state to current block if necessary
-        if (self.lastVirtualOrderBlock != block.number) {
-            executeVirtualTradesAndOrderExpiries(
-                self,
-                reserveMap,
-                block.number
-            );
+        if (self.lastVirtualOrderBlock < blockNumber) {
+            executeVirtualTradesAndOrderExpiries(self, reserveMap, blockNumber);
         }
     }
 
@@ -364,6 +411,7 @@ library LongTermOrdersLib {
 
             int256 outA = aStart + aIn - endA;
             int256 outB = bStart + bIn - endB;
+            require(outA >= 0 && outB >= 0, "Invalid Amount");
 
             return (
                 uint256(outA.toInt()),
@@ -398,13 +446,12 @@ library LongTermOrdersLib {
         int256 bStart
     ) private pure returns (int256 ammEndTokenA) {
         //rearranged for numerical stability
-        int256 eNumerator = PRBMathSD59x18
-            .fromInt(4)
-            .mul(tokenAIn)
-            .mul(tokenBIn)
-            .sqrt();
+        int256 eNumerator = PRBMathSD59x18.fromInt(4).mul(tokenAIn).sqrt().mul(
+            tokenBIn.sqrt()
+        );
         int256 eDenominator = aStart.sqrt().mul(bStart.sqrt()).inv();
         int256 exponent = eNumerator.mul(eDenominator).exp();
+        require(exponent > PRBMathSD59x18.abs(c), "Invalid Amount");
         int256 fraction = (exponent + c).div(exponent - c);
         int256 scaling = k.div(tokenBIn).sqrt().mul(tokenAIn.sqrt());
         ammEndTokenA = fraction.mul(scaling);
