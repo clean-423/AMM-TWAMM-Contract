@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 pragma solidity ^0.8.9;
 
-import "hardhat/console.sol";
+// import "hardhat/console.sol";
 import "prb-math/contracts/PRBMathUD60x18.sol";
 
 ///@notice An Order Pool is an abstraction for a pool of long term orders that sells a token at a constant rate to the embedded AMM.
@@ -72,7 +72,7 @@ library OrderPoolLib {
         returns (uint256 unsoldAmount, uint256 purchasedAmount)
     {
         uint256 expiry = self.orderExpiry[orderId];
-        require(expiry > block.number, "order already finished");
+        require(expiry > block.number, "Order Already Finished");
 
         //calculate amount that wasn't sold, and needs to be returned
         uint256 salesRate = self.salesRate[orderId];
@@ -102,14 +102,14 @@ library OrderPoolLib {
         returns (uint256 totalReward)
     {
         uint256 stakedAmount = self.salesRate[orderId];
-        require(stakedAmount > 0, "sales rate amount must be positive");
+        require(stakedAmount > 0, "Sales Rate Amount Must Be Positive");
         uint256 orderExpiry = self.orderExpiry[orderId];
         uint256 rewardFactorAtSubmission = self.rewardFactorAtSubmission[
             orderId
         ];
 
         //if order has expired, we need to calculate the reward factor at expiry
-        if (block.number > orderExpiry) {
+        if (block.number >= orderExpiry) {
             uint256 rewardFactorAtExpiry = self.rewardFactorAtBlock[
                 orderExpiry
             ];
